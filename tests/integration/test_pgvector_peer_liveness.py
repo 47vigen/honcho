@@ -306,10 +306,17 @@ async def test_actual_vector_sql_has_constant_peer_guards_and_no_probe(
     try:
         with _capture(pair_db) as statements:
             assert len(await _query(pair_db)) == 4
+        # Ranking runs on documents alone; liveness is checked on its candidates
+        # by one guarded statement, so there is still no peer probe.
+        ranking = [
+            sql for sql, _ in statements if "public.documents.embedding <=>" in sql
+        ]
+        assert len(ranking) == 1
+        assert "EXISTS" not in ranking[0]
         main = [
             (sql, params)
             for sql, params in statements
-            if "ORDER BY public.documents.embedding <=>" in sql
+            if "EXISTS (SELECT peers_" in sql
         ]
         assert len(main) == 1
         sql, params = main[0]
@@ -563,7 +570,7 @@ async def test_committed_parent_deletion_is_seen_on_next_read(
                         [
                             sql
                             for sql, _ in statements
-                            if "ORDER BY public.documents.embedding <=>" in sql
+                            if "public.documents.embedding <=>" in sql
                         ]
                     )
                     == 1

@@ -4,7 +4,16 @@ from logging import getLogger
 from typing import Any
 
 from nanoid import generate as generate_nanoid
-from sqlalchemy import ColumnElement, Select, TextClause, and_, or_, select, text
+from sqlalchemy import (
+    ColumnElement,
+    Select,
+    TextClause,
+    and_,
+    or_,
+    select,
+    text,
+    tuple_,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -952,6 +961,67 @@ async def _fetch_messages_by_ids(
     return [messages_by_id[mid] for mid in message_ids if mid in messages_by_id]
 
 
+# Candidate rows fetched per requested match. Liveness and observer scope drop a
+# few percent of a workspace, so 4x leaves a wide margin before the fallback.
+EXACT_CANDIDATE_MULTIPLIER = 4
+
+
+async def _exact_candidates_then_filter(
+    db: AsyncSession,
+    workspace_name: str,
+    session_name: str | None,
+    *,
+    query_embedding: list[float],
+    scope_clauses: Sequence[ColumnElement[bool]],
+    limit: int,
+) -> list[models.Message] | None:
+    """Exact nearest messages, ranked on message_embeddings alone, then filtered.
+
+    Ranking inside the messages join lets the liveness EXISTS clauses drive the
+    plan: the planner expects a handful of rows and probes all of them, which
+    costs tens of seconds on a large workspace. Ranking the embeddings first
+    reads each vector once and leaves liveness and scope to a few dozen rows.
+
+    Returns None when too few candidates survive the filters, so the caller
+    falls back to the single-statement query and results never shrink.
+    """
+    candidate_limit = limit * EXACT_CANDIDATE_MULTIPLIER
+    candidate_stmt = (
+        select(models.MessageEmbedding.tenant_id, models.MessageEmbedding.message_id)
+        .where(models.MessageEmbedding.workspace_name == workspace_name)
+        .where(models.MessageEmbedding.embedding.isnot(None))
+        # "+ 0" keeps the ranking exact: the expression no longer matches the
+        # HNSW operator class, so the planner cannot swap in approximate search.
+        .order_by(
+            models.MessageEmbedding.embedding.cosine_distance(query_embedding) + 0
+        )
+        .limit(candidate_limit)
+    )
+    if session_name:
+        candidate_stmt = candidate_stmt.where(
+            models.MessageEmbedding.session_name == session_name
+        )
+    candidate_rows = (await db.execute(candidate_stmt)).all()
+    # Keyed by tenant as well, as the original join was: message ids are not
+    # unique across tenants.
+    keys = list(dict.fromkeys((row[0], row[1]) for row in candidate_rows))
+    fetch_stmt = (
+        select(models.Message)
+        .where(tuple_(models.Message.tenant_id, models.Message.public_id).in_(keys))
+        .where(models.Message.workspace_name == workspace_name)
+        .where(live_message_row())
+        .where(*scope_clauses)
+    )
+    by_key = {
+        (msg.tenant_id, msg.public_id): msg
+        for msg in (await db.execute(fetch_stmt)).scalars().all()
+    }
+    matched = [by_key[key] for key in keys if key in by_key][:limit]
+    if len(matched) < limit and len(candidate_rows) == candidate_limit:
+        return None
+    return matched
+
+
 async def _search_messages_pgvector(
     db: AsyncSession,
     workspace_name: str,
@@ -965,6 +1035,20 @@ async def _search_messages_pgvector(
     context_window: int = 2,
 ) -> list[tuple[list[models.Message], list[models.Message]]]:
     """Run semantic message search against pgvector-backed embeddings."""
+    if after_date is None and before_date is None:
+        matched = await _exact_candidates_then_filter(
+            db,
+            workspace_name,
+            session_name,
+            query_embedding=query_embedding,
+            scope_clauses=scope_clauses,
+            limit=limit,
+        )
+        if matched is not None:
+            return await _build_merged_snippets(
+                db, workspace_name, matched, context_window
+            )
+
     # pgvector path: cosine distance in SQL
     # Oversample because a message with multiple embedding chunks can
     # produce duplicate rows; we deduplicate in Python to preserve HNSW
@@ -1078,7 +1162,7 @@ async def _semantic_search_messages(
         session_name,
         session_allowlist,
         observer,
-        models.MessageEmbedding.session_name,
+        models.Message.session_name,
     )
     if deny:
         return []

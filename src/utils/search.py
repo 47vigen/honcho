@@ -21,6 +21,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    tuple_,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -157,6 +158,65 @@ async def fetch_messages_by_ids(
     return [messages[msg_id] for msg_id in message_ids if msg_id in messages]
 
 
+# Candidate rows fetched per requested match; see crud.message for the reasoning.
+EXACT_CANDIDATE_MULTIPLIER = 4
+
+
+async def _exact_candidates_then_filter(
+    db: AsyncSession,
+    workspace_name: str,
+    embedding_query: list[float],
+    limit: int,
+    filters: dict[str, Any] | None,
+) -> list[models.Message] | None:
+    """Exact ranking on message_embeddings alone, then filters on the candidates.
+
+    Returns None when too few candidates survive the filters, so the caller
+    falls back to the single-statement query and results never shrink.
+    """
+    candidate_limit = limit * EXACT_CANDIDATE_MULTIPLIER
+    candidate_stmt = (
+        select(models.MessageEmbedding.tenant_id, models.MessageEmbedding.message_id)
+        .where(models.MessageEmbedding.workspace_name == workspace_name)
+        .where(models.MessageEmbedding.embedding.isnot(None))
+        # "+ 0" keeps the ranking exact: the expression no longer matches the
+        # HNSW operator class, so the planner cannot swap in approximate search.
+        .order_by(
+            models.MessageEmbedding.embedding.cosine_distance(embedding_query) + 0
+        )
+        .limit(candidate_limit)
+    )
+    # Plain equality filters narrow the candidates too; anything else is left
+    # to apply_filter on the fetched rows.
+    for key, column in (
+        ("session_id", models.MessageEmbedding.session_name),
+        ("peer_id", models.MessageEmbedding.peer_name),
+    ):
+        if filters and isinstance(filters.get(key), str):
+            candidate_stmt = candidate_stmt.where(column == filters[key])
+    from src.crud.lifecycle import live_message_row
+
+    candidate_rows = (await db.execute(candidate_stmt)).all()
+    # Keyed by tenant as well, as the original join was: message ids are not
+    # unique across tenants.
+    keys = list(dict.fromkeys((row[0], row[1]) for row in candidate_rows))
+    fetch_stmt = select(models.Message).where(
+        tuple_(models.Message.tenant_id, models.Message.public_id).in_(keys),
+        live_message_row(),
+    )
+    fetch_stmt = apply_filter(
+        fetch_stmt, models.Message, {**(filters or {}), "workspace_id": workspace_name}
+    )
+    by_key = {
+        (msg.tenant_id, msg.public_id): msg
+        for msg in (await db.execute(fetch_stmt)).scalars().all()
+    }
+    matched = [by_key[key] for key in keys if key in by_key][:limit]
+    if len(matched) < limit and len(candidate_rows) == candidate_limit:
+        return None
+    return matched
+
+
 async def _semantic_search_pgvector(
     db: AsyncSession,
     workspace_name: str,
@@ -178,6 +238,12 @@ async def _semantic_search_pgvector(
         list of messages ordered by semantic similarity
     """
     from src.crud.lifecycle import live_message_row
+
+    matched = await _exact_candidates_then_filter(
+        db, workspace_name, embedding_query, limit, filters
+    )
+    if matched is not None:
+        return matched
 
     distance_expr = models.MessageEmbedding.embedding.cosine_distance(embedding_query)
 

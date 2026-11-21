@@ -261,8 +261,10 @@ async def test_pgvector_message_search_scopes_in_sql(
         observer="observer-peer",
     )
 
-    assert len(capturing_tracked_db.statements) == 1
-    _assert_scoped_in_sql(capturing_tracked_db.statements[0], "message_embeddings")
+    # Ranking reads message_embeddings alone; the candidates are scoped in SQL
+    # when the messages are fetched.
+    assert len(capturing_tracked_db.statements) == 2
+    _assert_scoped_in_sql(capturing_tracked_db.statements[1], "messages")
 
 
 async def _grep_with_empty_allowlist(_db: _CapturingDB) -> list[Any]:

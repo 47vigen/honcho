@@ -478,6 +478,67 @@ async def fetch_documents_by_ids(
     return [documents[doc_id] for doc_id in document_ids if doc_id in documents]
 
 
+# Candidate rows fetched per requested conclusion; liveness drops almost none.
+EXACT_CANDIDATE_MULTIPLIER = 4
+
+
+async def _exact_candidates_then_filter(
+    db: AsyncSession,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    embedding: list[float],
+    filters: dict[str, Any] | None,
+    max_distance: float | None,
+    top_k: int,
+) -> list[models.Document] | None:
+    """Exact nearest conclusions, ranked on documents alone, then liveness.
+
+    With live_document_row() in the ranked statement the planner flips between
+    an exact scan and the HNSW index as statistics move; the HNSW plan drops a
+    quarter of the true top 40 at the default ef_search. Ranking without the
+    liveness clauses and checking them on the candidates keeps the result exact
+    and the plan stable.
+
+    Returns None when too few candidates survive liveness, so the caller falls
+    back to the single-statement query.
+    """
+    candidate_limit = top_k * EXACT_CANDIDATE_MULTIPLIER
+    distance = models.Document.embedding.cosine_distance(embedding)
+    candidate_stmt = (
+        select(models.Document.id)
+        .where(models.Document.tenant_id == models.scoped_tenant_id())
+        .where(models.Document.workspace_name == workspace_name)
+        .where(models.Document.observer == observer)
+        .where(models.Document.observed == observed)
+        .where(models.Document.embedding.isnot(None))
+        .where(models.Document.deleted_at.is_(None))
+    )
+    if max_distance is not None:
+        candidate_stmt = candidate_stmt.where(distance <= max_distance)
+    candidate_stmt = apply_filter(candidate_stmt, models.Document, filters)
+    # "+ 0" keeps the ranking exact: the expression no longer matches the HNSW
+    # operator class, so the planner cannot swap in approximate search.
+    candidate_stmt = candidate_stmt.order_by(distance + 0).limit(candidate_limit)
+    candidate_ids = list((await db.execute(candidate_stmt)).scalars().all())
+    if not candidate_ids:
+        return []
+    fetch_stmt = (
+        select(models.Document)
+        .where(models.Document.workspace_name == workspace_name)
+        .where(models.Document.observer == observer)
+        .where(models.Document.observed == observed)
+        .where(live_document_row(workspace_name, peer_pair=(observer, observed)))
+        .where(models.Document.id.in_(candidate_ids))
+    )
+    fetch_stmt = apply_filter(fetch_stmt, models.Document, filters)
+    by_id = {doc.id: doc for doc in (await db.execute(fetch_stmt)).scalars().all()}
+    matched = [by_id[doc_id] for doc_id in candidate_ids if doc_id in by_id][:top_k]
+    if len(matched) < top_k and len(candidate_ids) == candidate_limit:
+        return None
+    return matched
+
+
 async def _query_documents_pgvector(
     db: AsyncSession,
     workspace_name: str,
@@ -489,6 +550,12 @@ async def _query_documents_pgvector(
     top_k: int,
 ) -> list[models.Document]:
     """pgvector similarity search — pure DB operation."""
+    matched = await _exact_candidates_then_filter(
+        db, workspace_name, observer, observed, embedding, filters, max_distance, top_k
+    )
+    if matched is not None:
+        return matched
+
     stmt = (
         select(models.Document)
         .where(models.Document.workspace_name == workspace_name)
